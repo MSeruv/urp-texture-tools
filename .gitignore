@@ -1,0 +1,148 @@
+# This repo holds the scripts only. Nothing that goes through them, and nothing
+# personal, should ever end up in a commit. The rules below are deliberately
+# broad: it is easier to force add a file you actually want than to scrub one
+# that leaked into history.
+
+# ---------------------------------------------------------------- textures
+# Source sets and converted output
+Unity_URP/
+textures/
+Textures/
+*_2K-JPG/
+*_4K-JPG/
+*_1K-JPG/
+*.blend
+*.blend1
+
+# Any image or texture format, wherever it sits
+*.png
+*.jpg
+*.jpeg
+*.tga
+*.tif
+*.tiff
+*.exr
+*.hdr
+*.bmp
+*.psd
+*.psb
+*.dds
+*.ktx
+*.ktx2
+*.basis
+*.webp
+
+# Model and material sidecars that ship with downloaded sets
+*.fbx
+*.obj
+*.mtl
+*.usd
+*.usda
+*.usdc
+*.usdz
+*.mtlx
+*.tres
+*.sbsar
+*.sbs
+
+# Archives
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+
+# ------------------------------------------------------------ personal data
+# Local naming overrides can reveal client or project names.
+# names.example.json is committed instead.
+names.json
+!names.example.json
+
+# Credentials and secrets of any kind
+.env
+.env.*
+*.pem
+*.key
+*.ppk
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*_token
+*token.txt
+credentials*
+secrets*
+*.credentials
+
+# Local paths and machine specific config
+local_settings.py
+config.local.*
+*.local
+
+# ------------------------------------------------------------------- python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# --------------------------------------------------------------------- unity
+Library/
+Temp/
+Obj/
+Logs/
+UserSettings/
+*.csproj
+*.unityproj
+*.sln
+*.user
+*.pidb
+*.booproj
+
+# ------------------------------------------------------------------ editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claude/
+
+# --------------------------------------------------------------------- os
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.Spotlight-V100
+.Trashes

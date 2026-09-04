@@ -1,0 +1,5 @@
+{
+  "_comment": "Copy this to names.json to override the auto derived material names. Keys are source folder names, values are the T_ name you want. names.json is gitignored so your own project names stay local.",
+  "Metal021_2K-JPG": "T_METAL_BRUSHED",
+  "metal_plate_02_4k.blend": "T_METAL_PLATE"
+}
