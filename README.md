@@ -134,6 +134,53 @@ automatically; if it ships both, the OpenGL one is used. 16 bit sources stay 16 
 The colour map sets the output resolution and every other map is resampled to it, so
 mixed resolution sets come out consistent.
 
+### Output resolution
+
+The **Output resolution** dropdown caps the longest edge at 2048, 1024, 512 or 256 for
+mobile targets. It is the default for every set in the list; to give one set its own
+budget, double click its **Res** cell. Aspect ratio is preserved, a power of two source
+stays a power of two, and nothing is ever upscaled.
+
+Two checkboxes go with it:
+
+- **Height / occlusion at half resolution** — both maps are low frequency and rarely
+  earn the full budget.
+- **Compensate smoothness for lost normal detail** — on by default, explained below.
+
+Downscaling is done per map type rather than with one blanket resize, because three
+things go wrong otherwise:
+
+| Map | Naive resize | What happens instead |
+|---|---|---|
+| Base colour, emission | averaging gamma encoded values comes out muddy — a 0.0 and a 1.0 average to 0.5 encoded, which is 0.21 linear | decoded to linear, averaged, re-encoded |
+| Normal | averaging unit vectors produces short ones, so the surface reads flat and lights wrong | renormalised after averaging |
+| Smoothness | the surviving normal keeps a tight highlight the geometry no longer justifies, and the surface sparkles in motion | roughened by the measured normal variance, capped at 0.25 |
+
+The smoothness pass is a variance widening rather than Toksvig's original factor.
+Toksvig rescales a Blinn-Phong specular power, and the powers a glossy GGX material
+implies are enormous — smoothness 0.8 works out near 1250 — so even 0.99 agreement
+collapses the highlight. Measured on real normal maps that turns smoothness 0.80 into
+0.10 on a 2048 → 512 step: faithful to the detail that was lost, and a dead matte
+material. Widening the lobe by the measured variance and capping the drop takes the
+shimmer out without flattening the surface. Rough surfaces are barely touched, and a set
+converted at source resolution is bit for bit unaffected.
+
+Changing any of these counts as making the set out of date, even though no source file
+moved — the settings are recorded in the `_ImportNotes.txt` and compared on the next
+run.
+
+### What actually reaches the device
+
+Nothing written here does. Unity re-encodes these PNGs to a GPU format on import, and
+that is the setting that decides both VRAM and the compression artifacts you will see —
+so the PNGs stay lossless and the generated `_ImportNotes.txt` says which ASTC block
+size to ask for per map. Compressing them harder here would only bake artifacts in
+before ASTC got to them.
+
+Resolution is the lever this tool does own, and it is the bigger one: each step down is
+a 4× cut. A five map set at ASTC 6x6 with mipmaps comes to roughly 24 MB at 2048, 5.9 MB
+at 1024 and 1.5 MB at 512.
+
 An opacity map, or real alpha in the albedo, is packed into the base colour alpha.
 
 Converting one set into two different pipelines writes into the same folder, so the
@@ -170,10 +217,13 @@ python unity_texture_tools.py --cli --pipeline hdrp --extract
 python unity_texture_tools.py --cli --pipeline urp-metallic --force
 python unity_texture_tools.py --cli --dry-run
 python unity_texture_tools.py --cli --only metal_plate --name T_METAL_PLATE
+python unity_texture_tools.py --cli --max-res 1024                   # mobile
+python unity_texture_tools.py --cli --max-res 512 --half-data
 ```
 
-`--workspace`, `--names`, `--only`, `--name`, `--extract`, `--force` and `--dry-run` all
-behave the way their UI equivalents do.
+`--workspace`, `--names`, `--only`, `--name`, `--extract`, `--force`, `--dry-run`,
+`--max-res`, `--half-data` and `--no-smoothness-compensation` all behave the way their
+UI equivalents do.
 
 ## Using the results in Unity
 
@@ -190,6 +240,19 @@ For the textures:
 - Metallic, mask, height and occlusion maps: sRGB off
 - Specular, metallic and mask maps: compress with BC7 or DXT5, not DXT1, or you lose the
   smoothness stored in the alpha
+
+On mobile (Android / iOS), where the format matters more than anywhere else:
+
+- Base colour and emission: ASTC 6x6, or 8x8 for anything the camera never gets close to
+- Normal: ASTC 5x5 or 6x6 — normals band before colour does, so economise here last
+- Mask and metallic: ASTC 6x6, and it has to keep its alpha; ETC2 RGB and DXT1 discard
+  the smoothness
+- Height and occlusion: ASTC 8x8, or drop the height map — parallax rarely pays for
+  itself on mobile hardware
+- Generate Mip Maps on for anything in world space; without them a downscaled set still
+  shimmers at distance no matter what the smoothness says
+- ETC2 only as a fallback for devices without ASTC, and expect visible blocking on the
+  normal map
 - Normal: texture type Normal map, already OpenGL so leave it alone
 
 Every converted folder gets an `_ImportNotes.txt` repeating this for that specific set

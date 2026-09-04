@@ -15,11 +15,22 @@ converted set to something else without losing track of which map is which.
     python unity_texture_tools.py
     python unity_texture_tools.py --workspace "d:\\Textures"
     python unity_texture_tools.py --cli --pipeline hdrp --force
+    python unity_texture_tools.py --cli --max-res 1024 --half-data
 
 Pipelines:
     urp-specular   URP/Lit, Workflow Mode = Specular   (default)
     urp-metallic   URP/Lit, Workflow Mode = Metallic
     hdrp           HDRP/Lit, metallic + AO + smoothness packed into a mask map
+
+Output resolution can be capped at 2048 / 1024 / 512 / 256 for mobile targets,
+globally or per set. Downscaling is done per map type rather than with one
+blanket resize: colour is averaged in linear light, normals are renormalised
+afterwards, and smoothness is roughened to cover the normal detail the
+downscale removed, which is what stops a shrunk set sparkling in motion.
+
+What lands on the device is the GPU format Unity picks on import (ASTC, ETC2),
+not the PNGs written here -- so these stay lossless and the generated
+_ImportNotes.txt says which block size to ask for.
 """
 
 import argparse
@@ -177,6 +188,85 @@ NOISE_TOKENS = re.compile(
 
 
 # --------------------------------------------------------------------------
+# output resolution
+# --------------------------------------------------------------------------
+
+# Label shown in the UI -> longest output edge in pixels. 0 keeps the source.
+RESOLUTIONS = [
+    ("Source", 0),
+    ("2048", 2048),
+    ("1024", 1024),
+    ("512", 512),
+    ("256", 256),
+]
+RESOLUTION_LABELS = [label for label, _ in RESOLUTIONS]
+LABEL_TO_EDGE = dict(RESOLUTIONS)
+EDGE_TO_LABEL = {edge: label for label, edge in RESOLUTIONS}
+
+STAMP_PREFIX = "build settings:"
+
+
+class OutputOptions:
+    """Resolution and resampling choices, shared by the UI and the CLI.
+
+    max_edge    longest edge of the output in pixels, 0 to keep the source
+    half_data   write height and occlusion at half that again; they carry low
+                frequency information and rarely earn the full budget
+    compensate  fold the normal detail lost to downscaling back into smoothness
+    """
+
+    def __init__(self, max_edge=0, half_data=False, compensate=True):
+        self.max_edge = max(0, int(max_edge or 0))
+        self.half_data = bool(half_data)
+        self.compensate = bool(compensate)
+
+    def stamp(self):
+        """A one line record of these settings, written into the notes file.
+
+        Comparing it with the notes already on disk is what lets a resolution
+        change count as out of date. The source files have not been touched, so
+        mtimes alone would call a 4K output current after switching to 512.
+        """
+        return "%s max-edge=%d half-data=%s smoothness-compensation=%s" % (
+            STAMP_PREFIX, self.max_edge,
+            "on" if self.half_data else "off",
+            "on" if self.compensate else "off")
+
+
+DEFAULT_OPTIONS = OutputOptions()
+
+
+def read_stamp(path):
+    """The build settings line from an existing notes file, or None."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith(STAMP_PREFIX):
+                    return line.strip()
+    except OSError:
+        pass
+    return None
+
+
+def target_shape(shape, max_edge):
+    """Cap the longest edge at max_edge, keeping the aspect ratio.
+
+    A power of two source stays a power of two, because both edges end up
+    divided by the same power of two ratio.
+    """
+    h, w = shape
+    longest = max(h, w)
+    if not max_edge or longest <= max_edge:
+        return (h, w)
+    scale = float(max_edge) / longest
+    return (max(1, int(round(h * scale))), max(1, int(round(w * scale))))
+
+
+def half_shape(shape):
+    return (max(1, shape[0] // 2), max(1, shape[1] // 2))
+
+
+# --------------------------------------------------------------------------
 # colour helpers (image data is handled as float32 in 0..1 throughout)
 # --------------------------------------------------------------------------
 
@@ -282,12 +372,89 @@ def to_rgb(img):
 
 
 def fit(img, shape):
-    """Resample to (h, w) if the map does not match the reference resolution."""
+    """Resample to (h, w) if the map does not match the reference resolution.
+
+    INTER_AREA when shrinking: it averages every source texel that falls under
+    the destination one, so nothing is skipped no matter how big the step down.
+    Sampling filters alias badly at 1/4 scale and worse.
+    """
     if img.shape[:2] == shape:
         return img
     h, w = shape
     interp = cv2.INTER_AREA if img.shape[0] > h else cv2.INTER_CUBIC
     return cv2.resize(img, (w, h), interpolation=interp)
+
+
+def resample_srgb(img, shape):
+    """Fit sRGB encoded colour, doing the averaging in linear light.
+
+    Averaging gamma encoded values is why a naively downscaled albedo comes out
+    muddy: texels of 0.0 and 1.0 average to 0.5 encoded, which is 0.21 linear,
+    not the 0.5 linear the two texels between them actually carried.
+    """
+    if img.shape[:2] == shape:
+        return img
+    return np.clip(linear_to_srgb(fit(srgb_to_linear(img), shape)), 0.0, 1.0)
+
+
+def resample_normal(nrm, shape):
+    """Fit a tangent space normal map. Returns (map, agreement).
+
+    Averaging unit vectors produces short ones, and writing those back reads as
+    a flatter and wrongly lit surface, so the result is renormalised. The length
+    before renormalising is kept and handed back as "agreement": 1.0 where the
+    normals under a destination texel all pointed the same way, lower where real
+    surface detail was averaged out of existence. toksvig_smoothness turns that
+    into the roughness the flattened area should have had.
+    """
+    vec = np.ascontiguousarray(nrm[:, :, :3]) * 2.0 - 1.0
+    if vec.shape[:2] != shape:
+        vec = fit(vec, shape)
+    length = np.sqrt(np.maximum((vec * vec).sum(axis=2), 1e-12))
+    vec = vec / length[:, :, None]
+    return np.clip(vec * 0.5 + 0.5, 0.0, 1.0), np.clip(length, 0.0, 1.0)
+
+
+# How much of the lost normal variance is folded into roughness, and the most
+# smoothness any one conversion may give up.
+#
+# Toksvig's original factor is deliberately not used. It rescales a Blinn-Phong
+# specular power, and the powers a glossy GGX material implies are enormous --
+# smoothness 0.8 works out near 1250 -- so even 0.99 agreement collapses the
+# highlight to nothing. Measured on real normal maps that turns smoothness 0.80
+# into 0.10 on a 2048 -> 512 step: faithful to the detail that was lost, and a
+# dead matte material. Widening the GGX lobe by the measured variance instead,
+# and capping how far it can go, takes the shimmer out without flattening the
+# surface.
+NORMAL_VARIANCE_GAIN = 0.25
+MAX_SMOOTHNESS_DROP = 0.25
+
+
+def compensate_smoothness(smooth, agreement):
+    """Roughen smoothness by however much normal detail the downscale removed.
+
+    Most of the bumps in a 4K normal map do not survive the trip to 512. The
+    normal that does survive still points somewhere specific, so the material
+    keeps a tight highlight it no longer has the geometry to justify, and the
+    surface sparkles as the camera moves. Widening the highlight to cover the
+    spread that was averaged away is what the full resolution surface looked
+    like from far enough back anyway.
+
+    Rough surfaces are barely touched -- their lobe is already wider than the
+    variance being added -- and where the normals agreed, agreement is 1.0 and
+    this round trips exactly, so a set converted at source resolution is
+    untouched.
+    """
+    smooth = np.clip(smooth, 0.0, 1.0)
+    agreement = np.clip(agreement, 1e-3, 1.0)
+
+    perceptual = np.clip(1.0 - smooth, 0.0, 1.0)   # Unity's perceptual roughness
+    alpha = perceptual * perceptual                # GGX alpha
+    variance = (1.0 - agreement) / agreement       # spread of the averaged normals
+
+    alpha = np.sqrt(alpha * alpha + NORMAL_VARIANCE_GAIN * variance)
+    widened = np.clip(1.0 - np.sqrt(np.clip(alpha, 0.0, 1.0)), 0.0, 1.0)
+    return np.maximum(widened, smooth - MAX_SMOOTHNESS_DROP)
 
 
 # --------------------------------------------------------------------------
@@ -362,10 +529,14 @@ def normalize_name(name):
     return name if name.startswith("T_") else "T_" + name
 
 
-def needs_rebuild(sources, outputs, force):
+def needs_rebuild(sources, outputs, force, notes_path=None, stamp=None):
     if force:
         return True
     if not outputs or not all(os.path.exists(p) for p in outputs):
+        return True
+    # a resolution change leaves every source file untouched, so the settings
+    # recorded in the notes have to be checked as well as the timestamps
+    if stamp is not None and read_stamp(notes_path) != stamp:
         return True
     return max(os.path.getmtime(p) for p in sources) > \
         min(os.path.getmtime(p) for p in outputs)
@@ -430,8 +601,10 @@ def stale_outputs(pipeline, name, out_dir):
     return found
 
 
-def convert(folder, maps, name, out_dir, pipeline, dry_run=False, force=False, log=print):
+def convert(folder, maps, name, out_dir, pipeline, dry_run=False, force=False,
+            log=print, options=None):
     """Build one material set. Returns (status, written paths by logical key)."""
+    options = options or DEFAULT_OPTIONS
     planned = plan_outputs(pipeline, maps, name, out_dir)
     notes_path = os.path.join(out_dir, name + "_ImportNotes.txt")
     outputs = list(planned.values()) + [notes_path]
@@ -439,7 +612,8 @@ def convert(folder, maps, name, out_dir, pipeline, dry_run=False, force=False, l
     if not planned:
         log("  skip   %s  (nothing this pipeline can build)" % name)
         return "skipped", {}
-    if not needs_rebuild(list(maps.values()), outputs, force):
+    if not needs_rebuild(list(maps.values()), outputs, force,
+                         notes_path, options.stamp()):
         log("  skip   %s  (up to date)" % name)
         return "skipped", {}
 
@@ -449,23 +623,33 @@ def convert(folder, maps, name, out_dir, pipeline, dry_run=False, force=False, l
     if dry_run:
         for path in planned.values():
             log("           would write %s" % os.path.basename(path))
+        if options.max_edge:
+            log("           capped at %d px on the longest edge" % options.max_edge)
         return "dry-run", {}
 
     os.makedirs(out_dir, exist_ok=True)
     written = {}
 
-    # the colour map sets the output resolution; every other map is fitted to it
+    # the colour map sets the working resolution, capped by the chosen budget;
+    # every other map is fitted to it
     ref_src = maps.get("basecolor") or maps.get("normal_gl") or \
         maps.get("normal_dx") or maps.get("normal")
     ref_img, _ = imread(ref_src)
-    shape = ref_img.shape[:2]
+    source_shape = ref_img.shape[:2]
+    shape = target_shape(source_shape, options.max_edge)
+    data_shape = half_shape(shape) if options.half_data else shape
+    if shape != source_shape:
+        log("           resize      %dx%d -> %dx%d"
+            % (source_shape[1], source_shape[0], shape[1], shape[0]))
+    if data_shape != shape:
+        log("           data maps   %dx%d" % (data_shape[1], data_shape[0]))
 
-    def load(key, grey=True):
+    def load(key, grey=True, to=None):
         """Fitted source map, or (None, 8) when the set does not have one."""
         if key not in maps:
             return None, 8
         img, bits = imread(maps[key])
-        return fit(to_grey(img) if grey else to_rgb(img), shape), bits
+        return fit(to_grey(img) if grey else to_rgb(img), to or shape), bits
 
     def channel(key, default):
         """A single channel data map, or a constant when the set has none."""
@@ -474,14 +658,36 @@ def convert(folder, maps, name, out_dir, pipeline, dry_run=False, force=False, l
             return np.full(shape, default, np.float32)
         return np.clip(img, 0.0, 1.0)
 
+    # ---- normal first ------------------------------------------------------
+    # How much the normals changed under the resample is the input to the
+    # smoothness compensation below, so this has to happen before smoothness()
+    # is called. Unity expects the OpenGL / Y+ convention.
+    normal_img = agreement = None
+    normal_bits = 8
+    if "normal" in planned:
+        if "normal_gl" in maps:
+            src, flip_g = maps["normal_gl"], False
+        elif "normal" in maps:
+            src, flip_g = maps["normal"], False
+        else:
+            src, flip_g = maps["normal_dx"], True
+        nrm, normal_bits = imread(src)
+        nrm = to_rgb(nrm).copy()
+        if flip_g:
+            nrm[:, :, 1] = 1.0 - nrm[:, :, 1]
+        normal_img, agreement = resample_normal(nrm, shape)
+
     def smoothness():
         rough, _ = load("roughness")
         if rough is not None:
-            return np.clip(1.0 - rough, 0.0, 1.0)
-        gloss, _ = load("glossiness")
-        if gloss is not None:
-            return np.clip(gloss, 0.0, 1.0)
-        return np.full(shape, 0.5, np.float32)
+            value = np.clip(1.0 - rough, 0.0, 1.0)
+        else:
+            gloss, _ = load("glossiness")
+            value = np.clip(gloss, 0.0, 1.0) if gloss is not None \
+                else np.full(shape, 0.5, np.float32)
+        if options.compensate and agreement is not None:
+            value = compensate_smoothness(value, agreement)
+        return value
 
     def opacity():
         """Alpha for the base map: an opacity map, else the albedo's own alpha."""
@@ -501,9 +707,11 @@ def convert(folder, maps, name, out_dir, pipeline, dry_run=False, force=False, l
     # ---- base colour ------------------------------------------------------
     if "basecolor" in planned:
         albedo, _ = imread(maps["basecolor"])
-        albedo_rgb = fit(to_rgb(albedo), shape)
+        albedo_rgb = to_rgb(albedo)
         is_linear_src = os.path.splitext(maps["basecolor"])[1].lower() in (".exr", ".hdr")
-        albedo_lin = albedo_rgb if is_linear_src else srgb_to_linear(albedo_rgb)
+        # resize before encoding, so the averaging happens in linear light
+        albedo_lin = fit(albedo_rgb if is_linear_src else srgb_to_linear(albedo_rgb),
+                         shape)
         metal_mask = channel("metallic", 0.0)[:, :, None]
 
         if pipeline == PIPE_URP_SPEC:
@@ -511,8 +719,10 @@ def convert(folder, maps, name, out_dir, pipeline, dry_run=False, force=False, l
             base = linear_to_srgb(albedo_lin * (1.0 - metal_mask))
         elif is_linear_src:
             base = linear_to_srgb(albedo_lin)
-        else:
+        elif albedo_rgb.shape[:2] == shape:
             base = albedo_rgb  # already sRGB encoded, pass it through untouched
+        else:
+            base = linear_to_srgb(albedo_lin)
 
         alpha = opacity()
         if alpha is not None:
@@ -547,34 +757,32 @@ def convert(folder, maps, name, out_dir, pipeline, dry_run=False, force=False, l
         imwrite(planned["mask"], mask, 8)
         written["mask"] = planned["mask"]
 
-    # ---- normal (Unity expects the OpenGL / Y+ convention) ----------------
-    if "normal" in planned:
-        if "normal_gl" in maps:
-            src, flip_g = maps["normal_gl"], False
-        elif "normal" in maps:
-            src, flip_g = maps["normal"], False
-        else:
-            src, flip_g = maps["normal_dx"], True
-        nrm, bits = imread(src)
-        nrm = fit(to_rgb(nrm), shape).copy()
-        if flip_g:
-            nrm[:, :, 1] = 1.0 - nrm[:, :, 1]
-        imwrite(planned["normal"], nrm, 16 if bits == 16 else 8)
+    # ---- normal (resampled and renormalised further up) -------------------
+    if normal_img is not None:
+        imwrite(planned["normal"], normal_img, 16 if normal_bits == 16 else 8)
         written["normal"] = planned["normal"]
 
     # ---- single channel data maps ----------------------------------------
+    # height and occlusion are low frequency, so they can take the extra step
+    # down without anything visible going missing
     for key in ("height", "occlusion"):
         if key in planned:
-            img, bits = load(key)
+            img, bits = load(key, to=data_shape)
             imwrite(planned[key], img, 16 if (bits == 16 and key == "height") else 8)
             written[key] = planned[key]
 
     if "emissive" in planned:
-        img, _ = load("emissive", grey=False)
+        img, _ = imread(maps["emissive"])
+        img = to_rgb(img)
+        if os.path.splitext(maps["emissive"])[1].lower() in (".exr", ".hdr"):
+            img = fit(img, shape)
+        else:
+            img = resample_srgb(img, shape)
         imwrite(planned["emissive"], img, 8)
         written["emissive"] = planned["emissive"]
 
-    write_notes(notes_path, name, folder, maps, written, pipeline)
+    write_notes(notes_path, name, folder, maps, written, pipeline,
+                shape, data_shape, options)
 
     leftovers = stale_outputs(pipeline, name, out_dir)
     if leftovers:
@@ -586,7 +794,9 @@ def convert(folder, maps, name, out_dir, pipeline, dry_run=False, force=False, l
     return "built", written
 
 
-def write_notes(path, name, folder, maps, written, pipeline):
+def write_notes(path, name, folder, maps, written, pipeline,
+                shape=None, data_shape=None, options=None):
+    options = options or DEFAULT_OPTIONS
     header = {
         PIPE_URP_SPEC: "Unity URP/Lit, Workflow Mode = Specular",
         PIPE_URP_METAL: "Unity URP/Lit, Workflow Mode = Metallic",
@@ -595,8 +805,13 @@ def write_notes(path, name, folder, maps, written, pipeline):
 
     lines = ["%s  --  %s" % (name, header),
              "source: %s" % folder,
-             "",
-             "Material setup:"]
+             options.stamp()]
+    if shape:
+        lines.append("output: %d x %d" % (shape[1], shape[0]))
+        if data_shape and data_shape != shape:
+            lines.append("        height / occlusion at %d x %d"
+                         % (data_shape[1], data_shape[0]))
+    lines += ["", "Material setup:"]
     if pipeline == PIPE_URP_SPEC:
         lines += ["  Workflow Mode ......... Specular",
                   "  Smoothness Source ..... Specular Alpha"]
@@ -630,6 +845,29 @@ def write_notes(path, name, folder, maps, written, pipeline):
     note("occlusion", "-> Occlusion Map | sRGB OFF")
     note("emissive", "-> Emission Map  | sRGB ON")
 
+    lines += ["", "Mobile compression (Android / iOS):",
+              "  Nothing written here reaches the device -- Unity re-encodes these",
+              "  PNGs to a GPU format on import, and that is the setting that",
+              "  decides both VRAM and the artifacts you will actually see.",
+              "",
+              "  Base / Emission ....... ASTC 6x6. 8x8 for anything the camera never",
+              "                          gets close to.",
+              "  Normal ................ ASTC 5x5 or 6x6. Normals band before colour",
+              "                          does, so economise here last.",
+              "  Mask / Metallic ....... ASTC 6x6, and it has to keep its alpha --",
+              "                          ETC2 RGB and DXT1 discard the smoothness.",
+              "  Height ................ ASTC 8x8, or drop the map: parallax rarely",
+              "                          pays for itself on mobile hardware.",
+              "  Occlusion ............. ASTC 8x8.",
+              "  Generate Mip Maps ..... ON for anything in world space. Without them",
+              "                          a downscaled set still shimmers at distance.",
+              "  Fallback .............. ETC2 only for devices without ASTC; expect",
+              "                          visible blocking on the normal map."]
+    if shape:
+        lines += ["  Max Size .............. already %d here, so the importer value only"
+                  % max(shape),
+                  "                          matters if you want a further cut."]
+
     lines += ["", "Conversion applied (in linear space):"]
     if pipeline == PIPE_URP_SPEC:
         lines += ["  diffuse    = albedo * (1 - metallic)",
@@ -645,6 +883,16 @@ def write_notes(path, name, folder, maps, written, pipeline):
                   "  mask.g     = occlusion, or 1 when the set has none",
                   "  mask.b     = 0, no detail map",
                   "  mask.a     = 1 - roughness"]
+
+    if options.max_edge:
+        lines += ["", "Resampling applied:",
+                  "  colour     averaged in linear light, not on the encoded values",
+                  "  normal     renormalised after averaging, so it stays unit length"]
+        if options.compensate and "normal" in written:
+            lines += ["  smoothness roughened wherever averaging flattened the normal",
+                      "             map, by at most %.2f, which is what keeps the shrunk"
+                      % MAX_SMOOTHNESS_DROP,
+                      "             set from sparkling in motion"]
 
     lines += ["", "Source files:"]
     for key in sorted(maps):
@@ -818,14 +1066,18 @@ class ConvertTab(ttk.Frame):
         self.columnconfigure(1, weight=1)
 
         self.pipeline_label = tk.StringVar(value=PIPELINE_LABELS[PIPE_URP_SPEC])
+        self.resolution_label = tk.StringVar(value=EDGE_TO_LABEL[0])
+        self.half_data = tk.BooleanVar(value=False)
+        self.compensate = tk.BooleanVar(value=True)
         self.force = tk.BooleanVar(value=False)
         self.dry_run = tk.BooleanVar(value=False)
         self.unzip = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Scan the queue to get started.")
 
-        self.sets = {}       # source folder -> {logical map: source path}
-        self.names = {}      # source folder -> chosen output name
-        self.rows = {}       # tree row id -> source folder
+        self.sets = {}         # source folder -> {logical map: source path}
+        self.names = {}        # source folder -> chosen output name
+        self.resolutions = {}  # source folder -> max edge, when it overrides the default
+        self.rows = {}         # tree row id -> source folder
         self.editor = None   # the inline name entry, when one is open
         self.worker = None
         self.messages = queue.Queue()
@@ -845,6 +1097,18 @@ class ConvertTab(ttk.Frame):
         box.bind("<<ComboboxSelected>>", lambda e: self.refresh_rows())
 
         row += 1
+        ttk.Label(self, text="Output resolution").grid(row=row, column=0, sticky="w", pady=2)
+        res = ttk.Frame(self)
+        res.grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
+        res_box = ttk.Combobox(res, textvariable=self.resolution_label, state="readonly",
+                               width=10, values=RESOLUTION_LABELS)
+        res_box.grid(row=0, column=0, sticky="w")
+        res_box.bind("<<ComboboxSelected>>", lambda e: self.apply_resolution())
+        ttk.Label(res, text="longest edge in pixels  -  double click a row's Res cell "
+                            "to give one set its own budget",
+                  foreground="#666").grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+        row += 1
         opts = ttk.Frame(self)
         opts.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(6, 2))
         ttk.Checkbutton(opts, text="Rebuild even if up to date",
@@ -853,6 +1117,12 @@ class ConvertTab(ttk.Frame):
                         variable=self.dry_run).grid(row=0, column=1, sticky="w", padx=(16, 0))
         ttk.Checkbutton(opts, text="Extract .zip archives",
                         variable=self.unzip).grid(row=0, column=2, sticky="w", padx=(16, 0))
+        ttk.Checkbutton(opts, text="Height / occlusion at half resolution",
+                        variable=self.half_data, command=self.refresh_rows).grid(
+            row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(opts, text="Compensate smoothness for lost normal detail",
+                        variable=self.compensate, command=self.refresh_rows).grid(
+            row=1, column=1, columnspan=2, sticky="w", padx=(16, 0), pady=(4, 0))
 
         row += 1
         bar = ttk.Frame(self)
@@ -868,16 +1138,18 @@ class ConvertTab(ttk.Frame):
             row=0, column=3, padx=(8, 0))
 
         row += 1
-        ttk.Label(self, text="Double click an output name to change it, or leave the "
-                             "auto derived default.", foreground="#666").grid(
+        ttk.Label(self, text="Double click an output name or a Res cell to change it, "
+                             "or leave the auto derived defaults.",
+                  foreground="#666").grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(6, 2))
 
         row += 1
-        self.tree = ttk.Treeview(self, columns=("source", "maps", "name", "state"),
+        self.tree = ttk.Treeview(self, columns=("source", "maps", "name", "res", "state"),
                                  show="headings", height=9)
-        for col, text, width in (("source", "Queue folder", 200),
-                                 ("maps", "Maps found", 190),
-                                 ("name", "Output name", 180),
+        for col, text, width in (("source", "Queue folder", 180),
+                                 ("maps", "Maps found", 170),
+                                 ("name", "Output name", 170),
+                                 ("res", "Res", 70),
                                  ("state", "Status", 90)):
             self.tree.heading(col, text=text)
             self.tree.column(col, width=width, anchor="w")
@@ -916,6 +1188,21 @@ class ConvertTab(ttk.Frame):
     @property
     def pipeline(self):
         return LABEL_TO_PIPELINE[self.pipeline_label.get()]
+
+    @property
+    def max_edge(self):
+        return LABEL_TO_EDGE.get(self.resolution_label.get(), 0)
+
+    def options_for(self, folder):
+        """Build options for one set: its own resolution, or the default."""
+        return OutputOptions(self.resolutions.get(folder, self.max_edge),
+                             self.half_data.get(), self.compensate.get())
+
+    def apply_resolution(self):
+        """The dropdown is the default for every set, so it clears per row picks."""
+        self.cancel_edit()
+        self.resolutions = {}
+        self.refresh_rows()
 
     def write(self, text):
         self.log.configure(state="normal")
@@ -971,12 +1258,14 @@ class ConvertTab(ttk.Frame):
         for folder in sorted(self.sets):
             maps = self.sets[folder]
             name = self.names.get(folder, "")
+            options = self.options_for(folder)
             out_dir = os.path.join(self.app.converted_dir, name)
             planned = plan_outputs(pipeline, maps, name, out_dir)
             notes = os.path.join(out_dir, name + "_ImportNotes.txt")
             if not planned:
                 state = "no output"
-            elif needs_rebuild(list(maps.values()), list(planned.values()) + [notes], False):
+            elif needs_rebuild(list(maps.values()), list(planned.values()) + [notes],
+                               False, notes, options.stamp()):
                 state = "pending"
             else:
                 state = "up to date"
@@ -984,6 +1273,7 @@ class ConvertTab(ttk.Frame):
                 os.path.relpath(folder, self.app.queue_dir),
                 ", ".join(sorted(maps)),
                 name,
+                EDGE_TO_LABEL.get(options.max_edge, str(options.max_edge)),
                 state))
             self.rows[iid] = folder
 
@@ -1003,12 +1293,16 @@ class ConvertTab(ttk.Frame):
         self.cancel_edit()
         if self.tree.identify_region(event.x, event.y) != "cell":
             return
-        if self.tree.identify_column(event.x) != "#3":  # the name column
-            return
         iid = self.tree.identify_row(event.y)
         if not iid:
             return
+        column = self.tree.identify_column(event.x)
+        if column == "#3":
+            self.edit_name(iid)
+        elif column == "#4":
+            self.edit_resolution(iid)
 
+    def edit_name(self, iid):
         x, y, w, h = self.tree.bbox(iid, "name")
         var = tk.StringVar(value=self.tree.set(iid, "name"))
         entry = ttk.Entry(self.tree, textvariable=var)
@@ -1019,6 +1313,33 @@ class ConvertTab(ttk.Frame):
         entry.bind("<FocusOut>", lambda e: self.commit_edit(iid, var.get()))
         entry.bind("<Escape>", lambda e: self.cancel_edit())
         self.editor = entry
+
+    def edit_resolution(self, iid):
+        """A dropdown in the cell.
+
+        No FocusOut binding here: opening the list takes the focus with it, so
+        the editor would close before anything could be picked from it. The
+        commit is deferred to idle because the widget is destroyed from inside
+        its own event handler.
+        """
+        x, y, w, h = self.tree.bbox(iid, "res")
+        var = tk.StringVar(value=self.tree.set(iid, "res"))
+        box = ttk.Combobox(self.tree, textvariable=var, state="readonly",
+                           values=RESOLUTION_LABELS)
+        box.place(x=x, y=y, width=max(w, 80), height=h)
+        box.focus_set()
+        box.bind("<<ComboboxSelected>>",
+                 lambda e: self.after_idle(self.commit_resolution, iid, var.get()))
+        box.bind("<Escape>", lambda e: self.cancel_edit())
+        self.editor = box
+
+    def commit_resolution(self, iid, label):
+        self.cancel_edit()
+        folder = self.rows.get(iid)
+        if folder is None:
+            return
+        self.resolutions[folder] = LABEL_TO_EDGE.get(label, 0)
+        self.refresh_rows()
 
     def commit_edit(self, iid, text):
         editor, self.editor = self.editor, None
@@ -1055,9 +1376,9 @@ class ConvertTab(ttk.Frame):
             messagebox.showinfo("Nothing selected", "Select one or more rows first.")
             return
 
-        chosen = [(f, self.sets[f], self.names[f]) for f in folders]
+        chosen = [(f, self.sets[f], self.names[f], self.options_for(f)) for f in folders]
         seen = {}
-        for _, _, name in chosen:
+        for _, _, name, _ in chosen:
             seen[name] = seen.get(name, 0) + 1
         duplicates = sorted(n for n, count in seen.items() if count > 1)
         if duplicates:
@@ -1082,12 +1403,12 @@ class ConvertTab(ttk.Frame):
         log("")
         log("converting %d set(s) -> %s"
             % (len(job["sets"]), PIPELINE_LABELS[job["pipeline"]]))
-        for folder, maps, name in job["sets"]:
+        for folder, maps, name, options in job["sets"]:
             try:
                 status, _ = convert(folder, maps, name,
                                     os.path.join(job["out_root"], name),
                                     job["pipeline"], job["dry_run"], job["force"],
-                                    log=log)
+                                    log=log, options=options)
             except Exception as exc:  # a bad source file must not kill the batch
                 log("  !! %s failed: %s" % (name, exc))
                 status = "failed"
@@ -1546,13 +1867,18 @@ def run_cli(args):
     if args.name and len(sets) > 1:
         sys.exit("--name needs exactly one set, found %d (narrow it with --only)" % len(sets))
 
+    options = OutputOptions(args.max_res, args.half_data,
+                            not args.no_smoothness_compensation)
+    if options.max_edge:
+        print("output capped at %d px on the longest edge\n" % options.max_edge)
+
     tally = {}
     for folder in sorted(sets):
         key = os.path.basename(os.path.normpath(folder)).lower()
         name = normalize_name(args.name or overrides.get(key) or derive_name(folder))
         status, _ = convert(folder, sets[folder], name,
                             os.path.join(converted_dir, name), args.pipeline,
-                            args.dry_run, args.force)
+                            args.dry_run, args.force, options=options)
         tally[status] = tally.get(status, 0) + 1
 
     print("\n" + ", ".join("%d %s" % (v, k) for k, v in sorted(tally.items())))
@@ -1576,6 +1902,13 @@ def main():
                     help="json file mapping queue folder name -> T_ name")
     ap.add_argument("--extract", action="store_true",
                     help="unpack .zip archives in the queue first")
+    ap.add_argument("--max-res", type=int, default=0, metavar="PX",
+                    help="cap the longest output edge, e.g. 1024 (default: source)")
+    ap.add_argument("--half-data", action="store_true",
+                    help="write height and occlusion at half the output resolution")
+    ap.add_argument("--no-smoothness-compensation", action="store_true",
+                    help="skip the pass that roughens smoothness where downscaling "
+                         "flattened the normal map")
     ap.add_argument("--force", action="store_true",
                     help="reconvert even if outputs are up to date")
     ap.add_argument("--dry-run", action="store_true", help="report only, write nothing")
@@ -1586,7 +1919,7 @@ def main():
 
     root = tk.Tk()
     root.title("Unity Texture Tools")
-    root.minsize(860, 760)
+    root.minsize(900, 820)
     try:
         ttk.Style().theme_use("vista")
     except tk.TclError:
