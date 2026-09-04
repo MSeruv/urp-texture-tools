@@ -4,7 +4,9 @@
 # that leaked into history.
 
 # ---------------------------------------------------------------- textures
-# Source sets and converted output
+# The workspace: downloaded sets waiting to be converted, and the results
+Queue/
+Converted/
 Unity_URP/
 textures/
 Textures/
